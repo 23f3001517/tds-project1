@@ -1,0 +1,2 @@
+{"event": "received_message", "chat_id": 5777404119, "message": "What is the mean of [10, 20, 30, 40, 50]?"}
+{"event": "system_error", "error": "Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.', 'type': 'insufficient_quota', 'param': None, 'code': 'insufficient_quota'}}"}
