@@ -1,201 +1,205 @@
-import json
 import os
-import sys
-import io
+import json
 import threading
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+import logging
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from openai import OpenAI
+import requests
+from google import genai
+from flask import Flask
+try:
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+except ModuleNotFoundError as e:
+    print("Required package 'python-telegram-bot' is not installed.\nInstall dependencies with: python -m pip install -r requirements.txt")
+    raise
 
-# Load environment variables
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+LOG_PUBLIC_URL = os.getenv("LOG_PUBLIC_URL", "none")
+LOCAL_LOG_PATH = os.getenv("LOCAL_LOG_PATH", "run.jsonl")
+PORT = int(os.getenv("PORT", "10000"))  # Render sets $PORT for web services
+# --- Gist-based log upload ---
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GIST_ID = os.getenv("GIST_ID")
+GIST_FILENAME = os.getenv("GIST_FILENAME", "run.jsonl")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BASE_URL = os.getenv("BASE_URL")
+if not TELEGRAM_BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not set. Exiting.")
 
-# Initialize OpenAI Client
-client = OpenAI(api_key=OPENAI_API_KEY)
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY not set. Gemini calls will fail if attempted.")
 
-app = FastAPI()
+# --- Gemini client ---
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Ensure logs directory exists
-os.makedirs("logs", exist_ok=True)
-LOG_FILE = "logs/run.jsonl"
+PROMPT_INSTRUCTIONS = (
+    "You are a careful data-analyst agent. The user will send a plain-text message asking a data-analysis question. "
+    "You must reply with exactly one JSON object and nothing else. The object MUST have two keys: \"answer\" and \"log_url\". "
+    "The value of \"answer\" should be shaped exactly as the user's message requests (for example, if the user asks 'Reply with ONLY this JSON object: {\"answer\": {\"state\": \"<state name>\"}, \"log_url\": \"<url>\"}', then \"answer\" must be an object with key \"state\", etc.). "
+    "The value of \"log_url\" must be the public wget-able URL where the agent's run log will be available. Use the provided LOG_PUBLIC_URL value. Do not include any explanatory text or extra fields. "
+    "If you need to fetch data from a URL mentioned in the user's message, do so. If the user provided inline CSV or data, parse it. Keep outputs concise and strictly follow the requested JSON shape."
+)
 
-# In-memory memory for multi-turn conversations
-chat_histories = {}
 
-def log_step(data: dict):
-    """Appends a single JSON object to the JSONL log file."""
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(data) + "\n")
+def call_openai(system_prompt: str, user_prompt: str, max_tokens: int = 1000):
+    """Calls Gemini via google-genai SDK, returns (model_name, text). Name kept for minimal diff."""
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    resp = client.models.generate_content(
+        model=model_name,
+        contents=user_prompt,
+        config={
+            "system_instruction": system_prompt,
+            "temperature": 0.0,
+            "max_output_tokens": max_tokens,
+        },
+    )
+    text = resp.text.strip()
+    return model_name, text
 
-def execute_python_code(code: str) -> str:
-    """Executes Python code safely-ish and returns the printed output."""
-    old_stdout = sys.stdout
-    redirected_output = sys.stdout = io.StringIO()
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip() if update.message and update.message.text else ""
+    logger.info("Received message from %s (%s): %s", user.username, user.id, text)
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    system_prompt = PROMPT_INSTRUCTIONS + f"\nLOG_PUBLIC_URL={LOG_PUBLIC_URL}\n"
+    user_prompt = (
+        "Here is the user's message. Follow my earlier instructions and reply with exactly one JSON object and nothing else.\n"
+        "Message:\n" + text + "\n\nRespond with only the JSON object."
+    )
+
+    model_response_text = None
+    model_used = None
     try:
-        # Provide common data science libraries to the LLM's execution environment
-        exec_globals = {
-            "pd": __import__("pandas"), 
-            "np": __import__("numpy"), 
-            "requests": __import__("requests")
-        }
-        exec(code, exec_globals)
-        output = redirected_output.getvalue()
-        if not output.strip():
-            output = "Code executed successfully, but nothing was printed. Use print() to output results."
+        if client is None:
+            raise RuntimeError("GEMINI_API_KEY not configured")
+        model_used, model_response_text = call_openai(system_prompt, user_prompt)
+        logger.info("Model reply: %s", model_response_text)
     except Exception as e:
-        output = f"Error during execution: {e}"
-    finally:
-        sys.stdout = old_stdout
-    return output
+        logger.exception("Gemini call failed: %s", e)
+        fallback = {"answer": {"error": "gemini_call_failed", "message": str(e)}, "log_url": LOG_PUBLIC_URL}
+        model_response_text = json.dumps(fallback, ensure_ascii=False)
 
-# Define the tool for OpenAI
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_python_code",
-            "description": "Run Python code to download datasets (CSV/JSON), analyze data, and perform calculations. You have access to pandas (pd), numpy (np), and requests. Always use print() to output the result so you can read it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "The Python code to execute."
+    # Ensure the model output is a single JSON object
+    parsed = None
+    try:
+        parsed = json.loads(model_response_text)
+        if not isinstance(parsed, dict):
+            raise ValueError("Top-level JSON is not an object")
+    except Exception as e:
+        logger.warning("Model output not valid JSON object: %s", e)
+        try:
+            repair_prompt = (
+                "The previous model output was not a valid single JSON object. Extract or produce the exact single JSON object required (with keys 'answer' and 'log_url') and nothing else. "
+                "User message was:\n" + text + "\nPrevious model output:\n" + model_response_text
+            )
+            _, model_response_text = call_openai(PROMPT_INSTRUCTIONS, repair_prompt, max_tokens=800)
+            parsed = json.loads(model_response_text)
+            if not isinstance(parsed, dict):
+                raise ValueError("Repaired output not an object")
+        except Exception as e2:
+            logger.exception("Repair failed: %s", e2)
+            parsed = {"answer": {"error": "could_not_produce_valid_json"}, "log_url": LOG_PUBLIC_URL}
+            model_response_text = json.dumps(parsed, ensure_ascii=False)
+
+    # Ensure log_url in parsed is set to LOG_PUBLIC_URL
+    try:
+        parsed["log_url"] = LOG_PUBLIC_URL
+    except Exception:
+        parsed = {"answer": {"error": "invalid_parsed_structure"}, "log_url": LOG_PUBLIC_URL}
+        model_response_text = json.dumps(parsed, ensure_ascii=False)
+
+    # Write run log locally (append JSONL)
+    run_entry = {
+        "timestamp": timestamp,
+        "user_id": user.id,
+        "username": user.username,
+        "message": text,
+        "model": model_used,
+        "response_text": model_response_text,
+        "parsed_response": parsed,
+    }
+    try:
+        with open(LOCAL_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(run_entry, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("Failed to write local log")
+
+    # Upload the full local log to the GitHub Gist (overwrites the gist file
+    # with the current full contents of LOCAL_LOG_PATH each time).
+    if GITHUB_TOKEN and GIST_ID:
+        try:
+            with open(LOCAL_LOG_PATH, "r", encoding="utf-8") as f:
+                full_log_content = f.read()
+
+            gist_resp = requests.patch(
+                f"https://api.github.com/gists/{GIST_ID}",
+                headers={
+                    "Authorization": f"Bearer {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github+json",
+                },
+                json={
+                    "files": {
+                        GIST_FILENAME: {
+                            "content": full_log_content
+                        }
                     }
                 },
-                "required": ["code"]
-            }
-        }
-    }
-]
-
-@app.get("/")
-def home():
-    return {"message": "Telegram Data Analyst Agent Running"}
-
-@app.get("/run.jsonl")
-def logs():
-    return FileResponse(LOG_FILE)
-
-async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    user_message = update.message.text
-    
-    log_step({"event": "received_message", "chat_id": chat_id, "message": user_message})
-
-    # Initialize chat history for multi-turn grader tasks
-    if chat_id not in chat_histories:
-        chat_histories[chat_id] = [
-            {
-                "role": "system", 
-                "content": (
-                    "You are an expert Data-Analyst Agent. You can run Python code to analyze public datasets. "
-                    "When asked a question, write and execute Python code to find the exact answer. "
-                    "The user will specify a JSON shape for the final answer. "
-                    "Your final reply MUST be ONLY a valid JSON object. Do NOT wrap it in markdown block quotes (like ```json). "
-                    "Ensure your JSON has an 'answer' key that matches the requested shape."
-                )
-            }
-        ]
-        
-    chat_histories[chat_id].append({"role": "user", "content": user_message})
-    
-    messages = chat_histories[chat_id].copy()
-
-    try:
-        # Agentic Loop: Allow the LLM to call tools multiple times if needed
-        while True:
-            response = client.chat.completions.create(
-                model="gpt-4o", # Upgraded to gpt-4o for better coding capabilities
-                messages=messages,
-                tools=tools,
-                temperature=0,
+                timeout=15,
             )
-            
-            message = response.choices[0].message
-            messages.append(message)
-            
-            # If the LLM decides to run Python code
-            if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    if tool_call.function.name == "execute_python_code":
-                        args = json.loads(tool_call.function.arguments)
-                        code = args.get("code")
-                        
-                        log_step({"event": "tool_call", "code_executed": code})
-                        
-                        # Execute the code locally
-                        result = execute_python_code(code)
-                        
-                        log_step({"event": "tool_result", "output": result})
-                        
-                        # Feed the output back to the LLM
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.function.name,
-                            "content": result
-                        })
-                # Continue the while loop so the LLM can evaluate the code output
-            else:
-                # The LLM has reached its final answer and did not call a tool
-                break
-                
-        llm_content = message.content.strip()
-        log_step({"event": "final_llm_output", "content": llm_content})
+            logger.info("Gist update status=%s", gist_resp.status_code)
+            if gist_resp.status_code >= 400:
+                logger.error("Gist update failed: %s", gist_resp.text)
+        except Exception:
+            logger.exception("Log upload to gist failed")
+    else:
+        logger.warning("GITHUB_TOKEN or GIST_ID not set; skipping gist log upload")
 
-        # Parse output to enforce grading JSON structure
-        if llm_content.startswith("```json"):
-            llm_content = llm_content[7:-3].strip()
-        elif llm_content.startswith("```"):
-            llm_content = llm_content[3:-3].strip()
-            
-        try:
-            response_json = json.loads(llm_content)
-            answer_payload = response_json.get("answer", response_json)
+    # Send exactly the JSON object as the reply text
+    reply_text = json.dumps(parsed, ensure_ascii=False)
+    await update.message.reply_text(reply_text)
 
-            final_reply = {
-                "answer": answer_payload,
-                "log_url": f"{BASE_URL.rstrip('/')}/run.jsonl"
-            }
-        except json.JSONDecodeError:
-            final_reply = {
-                "answer": {"error": "Failed to parse final JSON", "raw": llm_content},
-                "log_url": f"{BASE_URL.rstrip('/')}/run.jsonl"
-            }
 
-        # Save assistant's final response to history for multi-turn
-        chat_histories[chat_id].append({"role": "assistant", "content": json.dumps(final_reply)})
+# --- Flask keep-alive server -------------------------------------------------
+# Render's Web Service type waits for something to bind $PORT. The Telegram
+# bot itself never opens a port (it's a polling process), so without this,
+# Render considers the deploy failed / keeps restarting the container.
+# If you deploy this as a Render "Background Worker" instead, this part is
+# not required, but it's harmless to leave in.
+flask_app = Flask(__name__)
 
-        final_reply_str = json.dumps(final_reply)
-        log_step({"event": "sent_reply", "payload": final_reply})
 
-        await update.message.reply_text(final_reply_str)
-        
-    except Exception as e:
-        error_msg = str(e)
-        log_step({"event": "system_error", "error": error_msg})
-        await update.message.reply_text(json.dumps({
-            "answer": {"error": "Internal Agent Error"},
-            "log_url": f"{BASE_URL.rstrip('/')}/run.jsonl"
-        }))
+@flask_app.route("/")
+def health():
+    return "Bot is running", 200
 
-def telegram_bot():
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
-    print("Telegram Agent Started...")
-    telegram_app.run_polling()
 
-@app.on_event("startup")
-async def startup():
-    # Clear old logs on startup
-    if os.path.exists(LOG_FILE):
-        open(LOG_FILE, 'w').close() 
-    threading.Thread(target=telegram_bot, daemon=True).start()
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT)
+
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN environment variable required.")
+        return
+
+    # Start Flask in a background thread so Render sees an open port
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
+    app.add_handler(handler)
+
+    print(f"Bot starting. Flask health check on port {PORT}. Listening for Telegram messages...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
